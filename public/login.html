@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entrar — Estrutura Energia Solar</title>
+  <style>
+    :root { --navy:#063b76; --orange:#f57c00; --ink:#172033; --muted:#6b7280; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; padding:22px; font-family:Inter,Segoe UI,system-ui,sans-serif; color:var(--ink); background:linear-gradient(135deg,#031f40,#0a4a85 58%,#f57c00 160%); }
+    .box { width:min(420px,100%); background:#fff; border-radius:22px; padding:32px; box-shadow:0 24px 80px #02152b88; text-align:center; }
+    .brand { display:flex; align-items:center; justify-content:center; gap:12px; color:var(--navy); font-weight:900; letter-spacing:.3px; font-size:18px; }
+    .brand img { width:60px; height:60px; object-fit:cover; border-radius:14px; }
+    .brand img.wordmark { width:270px; height:72px; object-fit:contain; border-radius:12px; }
+    .brand b { color:var(--orange); }
+    h1 { font-size:22px; margin:24px 0 6px; }
+    p { color:var(--muted); font-size:14px; line-height:1.5; margin:0 0 20px; }
+    input { width:100%; padding:14px 15px; border:1.5px solid #dce3ed; border-radius:11px; font-size:16px; text-align:center; }
+    input:focus { outline:0; border-color:var(--orange); box-shadow:0 0 0 3px #f57c0024; }
+    button { width:100%; margin-top:14px; padding:14px; border:0; border-radius:11px; background:var(--orange); color:white; font-size:16px; font-weight:800; cursor:pointer; }
+    button:hover { filter:brightness(.95); }
+    .erro { display:none; color:#b91c1c; background:#fef2f2; padding:10px; border-radius:9px; margin-top:13px; font-size:13px; }
+    .hint { font-size:12px; margin-top:18px; color:#8a93a2; }
+    a { color:var(--navy); font-weight:700; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <main class="box">
+    <div class="brand"><img class="wordmark" src="/img/estrutura-wordmark.png" alt="Estrutura Energia Solar"></div>
+    <h1>Área do consultor</h1>
+    <p>Consulte os leads captados, faça prospecção e acompanhe seu funil.</p>
+    <form onsubmit="entrar(event)">
+      <input id="senha" type="password" autocomplete="current-password" placeholder="Senha do painel" autofocus>
+      <button id="btn">Entrar no painel →</button>
+    </form>
+    <div id="erro" class="erro"></div>
+    <div class="hint">Link público para clientes: <a href="/captar">/captar</a></div>
+  </main>
+<script>
+async function entrar(event) {
+  event.preventDefault();
+  const btn = document.getElementById('btn');
+  const erro = document.getElementById('erro');
+  btn.disabled = true; btn.textContent = 'Entrando…'; erro.style.display = 'none';
+  try {
+    const r = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({senha:document.getElementById('senha').value}) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Não foi possível entrar.');
+    window.location.href = '/';
+  } catch (e) {
+    erro.textContent = e.message; erro.style.display = 'block';
+    btn.disabled = false; btn.textContent = 'Entrar no painel →';
+  }
+}
+</script>
+</body>
+</html>
