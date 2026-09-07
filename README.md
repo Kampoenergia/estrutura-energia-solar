@@ -1,3 +1,5 @@
+> **Modo atual: temporário, sem Neon e sem disco.** Leia `MODO-TEMPORARIO.md`. Os procedimentos abaixo sobre PostgreSQL são históricos/opcionais; não são necessários para esta configuração.
+
 # Estrutura Energia Solar — v1.2
 
 Versão adaptada para reutilizar o serviço Render pago existente com PostgreSQL no Neon, sem contratar outro serviço ou disco. Os arquivos originais enviados foram preservados.

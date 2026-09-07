@@ -83,6 +83,6 @@ test('Falha ao persistir não devolve confirmação nem evento de conversão', a
   const response=await call('/api/capture','POST',{nome:'Contato de teste',whatsapp:'47987654321',cidade:'Joinville',propertyType:'comercial',conta:700,consentimento:true});
   assert.equal(response.status,503);const data=await response.json();assert.equal(data.measurement,undefined);assert.equal(data.ok,undefined);
 });
-test('Produção sem DATABASE_URL não cai em armazenamento efêmero',()=>{
-  assert.throws(()=>createApp({production:true,password:'senha-longa-e-exclusiva-para-testar',databaseUrl:''}),/DATABASE_URL/);
+test('Modo PostgreSQL explícito exige DATABASE_URL',()=>{
+  assert.throws(()=>createApp({production:true,storageMode:'postgres',password:'senha-longa-e-exclusiva-para-testar',databaseUrl:''}),/DATABASE_URL/);
 });

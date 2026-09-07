@@ -44,7 +44,7 @@ function renderLeads(){
 }
 function renderSettings(){
  $('security-status').innerHTML=state.config.production?'<span class="pill pill-green">Ambiente de produção</span>':'<span class="pill pill-orange">Desenvolvimento / prévia</span>';
- $('storage-status').innerHTML=state.config.storageKind==='postgres'?'<span class="pill pill-green">PostgreSQL · armazenamento externo</span>':state.config.storageConfigured?'<span class="pill pill-blue">Pasta DATA_DIR configurada</span>':'<span class="pill pill-orange">Pasta local · confirme persistência ao publicar</span>';
+ $('storage-status').innerHTML=state.config.storageKind==='memory'?'<span class="pill pill-orange">Temporário · perde dados ao reiniciar</span>':state.config.storageKind==='postgres'?'<span class="pill pill-green">PostgreSQL · armazenamento externo</span>':state.config.storageConfigured?'<span class="pill pill-blue">Pasta DATA_DIR configurada</span>':'<span class="pill pill-orange">Pasta local · confirme persistência ao publicar</span>';
 }
 function render(){ $('nav-total').textContent=state.leads.length;renderDashboard();renderLeads();renderSettings(); }
 async function loadAll(){

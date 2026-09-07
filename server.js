@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { createStore } = require('./lib/store');
+const { createMemoryStore } = require('./lib/memory-store');
 const { createPostgresStore } = require('./lib/postgres-store');
 const { advertisingConfig } = require('./lib/ads');
 const { limiter, protection, authentication } = require('./lib/security');
@@ -18,7 +19,9 @@ function createApp(options = {}) {
   if (siteUrl) { const u = new URL(siteUrl); if (!['https:', 'http:'].includes(u.protocol)) throw new Error('SITE_URL inválida.'); }
   const trustProxy = options.trustProxy ?? Number(process.env.TRUST_PROXY ?? (production || preview ? 1 : 0));
   const databaseUrl = options.databaseUrl ?? process.env.DATABASE_URL;
-  const store = options.store || (options.dataDir ? createStore(options.dataDir) : (production || databaseUrl) ? createPostgresStore(databaseUrl) : createStore(process.env.DATA_DIR || path.join(__dirname, 'data')));
+  const storageMode = options.storageMode ?? process.env.STORAGE_MODE ?? 'memory';
+  if (!['memory','postgres','file'].includes(storageMode)) throw new Error('STORAGE_MODE inválido.');
+  const store = options.store || (options.dataDir ? createStore(options.dataDir) : storageMode === 'memory' ? createMemoryStore() : storageMode === 'postgres' ? createPostgresStore(databaseUrl) : createStore(process.env.DATA_DIR || path.join(__dirname, 'data')));
   const fetchExternal = options.fetch || global.fetch;
   const app = express();
   app.locals.store = store;
@@ -99,7 +102,7 @@ function createApp(options = {}) {
   app.get(['/', '/index.html'], async (req, res) => res.set('X-Robots-Tag', 'noindex, nofollow').sendFile(path.join(publicDir, 'index.html')));
   app.post('/api/logout', auth.logout);
   app.get('/logout', async (req, res) => res.redirect('/'));
-  app.get('/api/config', async (req, res) => res.json({ ...brand, version: '1.2.0', advertising, preview, production, storageKind: store.kind || 'json', storageConfigured: store.kind === 'postgres' || Boolean(options.dataDir || process.env.DATA_DIR), storage: store.kind === 'postgres' ? 'PostgreSQL externo com transações, cópia anterior e sete backups diários lógicos. Mantenha também backup externo.' : 'Arquivo JSON local, somente para desenvolvimento nesta versão.', estimates: 'Referências internas legadas. Não são orçamento nem dimensionamento técnico.' }));
+  app.get('/api/config', async (req, res) => res.json({ ...brand, version: '1.2.0', advertising, preview, production, storageKind: store.kind || 'json', storageConfigured: ['memory','postgres'].includes(store.kind) || Boolean(options.dataDir || process.env.DATA_DIR), storage: store.kind === 'memory' ? 'Somente memória: contatos perdidos ao reiniciar ou republicar. Sem banco, disco ou backup automático. Exporte o que quiser conservar.' : store.kind === 'postgres' ? 'PostgreSQL externo com transações, cópia anterior e sete backups diários lógicos. Mantenha também backup externo.' : 'Arquivo JSON local, somente para desenvolvimento nesta versão.', estimates: 'Referências internas legadas. Não são orçamento nem dimensionamento técnico.' }));
   app.get('/api/segments', async (req, res) => res.json(Object.entries(SEGMENTS).map(([key, s]) => ({ key, label: s.label.replace(/^\S+\s/, ''), propertyType: s.propertyType }))));
   app.get('/api/leads', async (req, res) => res.json(filteredLeads(await readLeads(), req.query)));
 
