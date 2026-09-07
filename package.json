@@ -1,15 +1,21 @@
 {
   "name": "estrutura-energia-solar-leads",
-  "version": "1.0.0",
-  "description": "Captação, prospecção e funil de leads para vendas de energia solar",
+  "version": "1.2.0",
+  "private": true,
+  "description": "Pré-análise solar, captação e acompanhamento de oportunidades da Estrutura Energia Solar",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test tests/*.test.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.12"
   },
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
   }
 }

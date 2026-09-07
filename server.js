@@ -1,207 +1,259 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { createStore } = require('./lib/store');
+const { createPostgresStore } = require('./lib/postgres-store');
+const { advertisingConfig } = require('./lib/ads');
+const { limiter, protection, authentication } = require('./lib/security');
+const { solarEstimate } = require('./lib/solar');
+const { STATUSES, TEMPERATURES, PROPERTIES, SEGMENTS, text, digits, now, phoneDigits, validPhone, safeWebsite, readTracking, autoTemperature, normalizeLead, history, newId, filteredLeads, csvCell } = require('./lib/domain');
 
-const app = express();
-app.use(express.json({ limit: '300kb' }));
+function createApp(options = {}) {
+  const production = options.production ?? (process.env.NODE_ENV === 'production');
+  const preview = options.preview ?? (process.env.PREVIEW_MODE === '1');
+  const password = options.password ?? process.env.PANEL_SENHA ?? 'estrutura2026';
+  if (production && (password.length < 16 || password === 'estrutura2026' || /troque|sua-senha|change-me/i.test(password))) throw new Error('Defina PANEL_SENHA com uma senha exclusiva de pelo menos 16 caracteres antes de publicar.');
+  const siteUrl = options.siteUrl ?? process.env.SITE_URL ?? '';
+  if (siteUrl) { const u = new URL(siteUrl); if (!['https:', 'http:'].includes(u.protocol)) throw new Error('SITE_URL inválida.'); }
+  const trustProxy = options.trustProxy ?? Number(process.env.TRUST_PROXY ?? (production || preview ? 1 : 0));
+  const databaseUrl = options.databaseUrl ?? process.env.DATABASE_URL;
+  const store = options.store || (options.dataDir ? createStore(options.dataDir) : (production || databaseUrl) ? createPostgresStore(databaseUrl) : createStore(process.env.DATA_DIR || path.join(__dirname, 'data')));
+  const fetchExternal = options.fetch || global.fetch;
+  const app = express();
+  app.locals.store = store;
+  app.disable('x-powered-by');
+  app.set('trust proxy', trustProxy);
+  const advertising = advertisingConfig({ production, preview, env: options.adsEnv || process.env });
+  app.use(protection({ preview, siteUrl, trustProxy, advertising }));
+  app.use(express.json({ limit: '160kb' }));
+  app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+  const auth = authentication({ password, production, preview });
+  const publicDir = path.join(__dirname, 'public');
+  const brand = { name: 'Estrutura Energia Solar', whatsapp: '5547989022728', region: ['Guaramirim', 'Jaraguá do Sul', 'Joinville'], address: 'Rua 28 de Agosto, 682 — Centro, Guaramirim/SC', instagram: 'https://www.instagram.com/estruturaenergiasolar/' };
+  const readLeads = async () => (await store.read()).map(normalizeLead);
+  const httpError = (status, message) => Object.assign(new Error(message), { status, expose: true });
+  const invalid = (res, message) => res.status(400).json({ error: message });
 
-// ================= AUTENTICAÇÃO DO PAINEL =================
-const SENHA = process.env.PANEL_SENHA || 'estrutura2026';
-const TOKEN = crypto.createHash('sha256').update('estrutura-solar-salt::' + SENHA).digest('hex');
-function getCookie(req, name) { const c = req.headers.cookie || ''; const m = c.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)')); return m ? m[1] : null; }
-function isAuthed(req) { return getCookie(req, 'estrutura_auth') === TOKEN; }
-function isPublicPath(p) { return p === '/captar' || p === '/captar.html' || p === '/login' || p === '/login.html' || p === '/api/login' || p === '/api/capture' || p.startsWith('/img/') || p.startsWith('/favicon'); }
-app.use((req, res, next) => { if (isPublicPath(req.path)) return next(); if (isAuthed(req)) return next(); if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Não autorizado. Faça login no painel.' }); return res.redirect('/login'); });
-app.post('/api/login', (req, res) => { if ((req.body || {}).senha !== SENHA) return res.status(401).json({ error: 'Senha incorreta.' }); res.setHeader('Set-Cookie', `estrutura_auth=${TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`); res.json({ ok: true }); });
-app.get('/login', (req, res) => { if (isAuthed(req)) return res.redirect('/'); res.sendFile(path.join(__dirname, 'public', 'login.html')); });
-app.get('/logout', (req, res) => { res.setHeader('Set-Cookie', 'estrutura_auth=; Path=/; HttpOnly; Max-Age=0'); res.redirect('/login'); });
-app.use(express.static(path.join(__dirname, 'public')));
+  app.get('/healthz', async (req, res) => res.json({ ok: true, service: 'estrutura-solar' }));
+  app.get('/robots.txt', async (req, res) => res.type('text').send('User-agent: *\nDisallow: /api/\nDisallow: /login\nDisallow: /index.html\nAllow: /captar\n'));
+  app.use('/assets', express.static(path.join(publicDir, 'assets'), { maxAge: '1h', dotfiles: 'deny' }));
+  app.use('/img', express.static(path.join(publicDir, 'img'), { maxAge: '1d', dotfiles: 'deny' }));
+  app.get('/favicon.svg', async (req, res) => res.sendFile(path.join(publicDir, 'favicon.svg')));
+  app.get('/api/site-config', async (req, res) => res.json({ ...brand, advertising, assets: {
+    wordmark: fs.existsSync(path.join(publicDir, 'img/estrutura-wordmark.png')) ? '/img/estrutura-wordmark.png' : null,
+    hero: fs.existsSync(path.join(publicDir, 'img/hero-solar.jpg')) ? '/img/hero-solar.jpg' : null,
+    logo: fs.existsSync(path.join(publicDir, 'img/estrutura-logo.jpg')) ? '/img/estrutura-logo.jpg' : null
+  } }));
+  app.get(['/captar', '/captar.html'], async (req, res) => res.sendFile(path.join(publicDir, 'captar.html')));
+  app.get(['/login', '/login.html'], async (req, res) => {
+    res.set('Cache-Control', 'no-store').set('X-Robots-Tag', 'noindex, nofollow');
+    if (auth.authed(req)) return res.redirect('/');
+    res.sendFile(path.join(publicDir, 'login.html'));
+  });
+  app.post('/api/login', limiter({ limit: 10, windowMs: 15 * 60000, message: 'Muitas tentativas. Aguarde 15 minutos e tente novamente.' }), auth.login);
 
-const DATA_FILE = path.join(__dirname, 'data', 'leads.json');
-const STATUS_VALUES = ['novo', 'contatado', 'interessado', 'visita_solicitada', 'visita_realizada', 'proposta', 'negociacao', 'fechado', 'sem_resposta', 'perdido'];
-const TEMPERATURE_VALUES = ['quente', 'morno', 'frio'];
-const CITY_REGION = ['Guaramirim', 'Jaraguá do Sul', 'Joinville'];
-
-// ================= PROSPECÇÃO =================
-const SEGMENTS = {
-  industria: { label: '🏭 Indústria / fábrica', selector: '["industrial"="yes"]', kwh: 28000, intensity: 5, propertyType: 'industrial' },
-  galpao: { label: '🏢 Galpão / centro logístico', selector: '["building"="warehouse"]', kwh: 18000, intensity: 5, propertyType: 'comercial' },
-  supermercado: { label: '🛒 Supermercado', selector: '["shop"="supermarket"]', kwh: 12000, intensity: 5, propertyType: 'comercial' },
-  hotel: { label: '🏨 Hotel / pousada', selector: '["tourism"="hotel"]', kwh: 9000, intensity: 5, propertyType: 'comercial' },
-  restaurante: { label: '🍽️ Restaurante', selector: '["amenity"="restaurant"]', kwh: 4500, intensity: 4, propertyType: 'comercial' },
-  padaria: { label: '🥖 Padaria', selector: '["shop"="bakery"]', kwh: 4500, intensity: 4, propertyType: 'comercial' },
-  academia: { label: '💪 Academia', selector: '["leisure"="fitness_centre"]', kwh: 4000, intensity: 4, propertyType: 'comercial' },
-  posto: { label: '⛽ Posto de combustível', selector: '["amenity"="fuel"]', kwh: 5000, intensity: 4, propertyType: 'comercial' },
-  escola: { label: '🏫 Escola / faculdade', selector: '["amenity"="school"]', kwh: 6000, intensity: 4, propertyType: 'comercial' },
-  hospital: { label: '🏥 Hospital / clínica', selector: '["amenity"="hospital"]', kwh: 11000, intensity: 5, propertyType: 'comercial' },
-  condominio: { label: '🏘️ Condomínio / síndico', selector: '["building"="apartments"]', kwh: 7000, intensity: 4, propertyType: 'residencial' },
-  agro: { label: '🌾 Agro / propriedade rural', selector: '["landuse"="farmyard"]', kwh: 8000, intensity: 4, propertyType: 'rural' },
-};
-
-// ================= CÁLCULO SOLAR =================
-const PRICE_PER_PANEL = 1500;
-const FINANCE_RATE_START = 0.018; // parâmetro interno; não é exibido no site
-const FINANCE_MONTHS = 72;
-const POST_SOLAR_BILL = 60;
-function priceInstallment(principal, rate, months) { const p = Number(principal) || 0; const i = Number(rate) || 0; const n = Number(months) || FINANCE_MONTHS; if (p <= 0 || n <= 0) return 0; if (i <= 0) return p / n; return p * i / (1 - Math.pow(1 + i, -n)); }
-function solarEstimate(conta, propertyType = 'comercial') {
-  const bill = Math.max(150, Number(conta) || 0);
-  const tariffs = { residencial: 0.82, comercial: 0.86, industrial: 0.95, rural: 0.86 };
-  const tariff = tariffs[propertyType] || tariffs.comercial;
-  const kwh = bill / tariff;
-  // Calibração informada: uma conta de R$ 500 corresponde a 10 placas.
-  const panels = Math.max(3, Math.round(bill / 50));
-  const kwp = Math.round(panels * 0.55 * 10) / 10;
-  const remainingBill = Math.min(POST_SOLAR_BILL, Math.round(bill * 100) / 100);
-  const economyMonth = Math.max(0, Math.round((bill - remainingBill) * 100) / 100);
-  const economyYear = Math.round(economyMonth * 12 * 100) / 100;
-  const systemValue = panels * PRICE_PER_PANEL;
-  const financingInstallment = Math.round(priceInstallment(systemValue, FINANCE_RATE_START, FINANCE_MONTHS) * 100) / 100;
-  const paybackMonths = economyMonth > 0 ? Math.round((systemValue / economyMonth) * 10) / 10 : 0;
-  return { contaEst: Math.round(bill), tariff, kwhEst: Math.round(kwh), systemKwp: kwp, panels, economyMonth, economyYear, remainingBill, systemValue, financingMonths: FINANCE_MONTHS, financingInstallment, paybackMonths, paybackYears: Math.round((paybackMonths / 12) * 10) / 10, pricePerPanel: PRICE_PER_PANEL };
-}
-
-function cleanText(value, max = 180) { return String(value == null ? '' : value).trim().slice(0, max); }
-function digits(value) { return String(value || '').replace(/\D/g, ''); }
-function isoNow() { return new Date().toISOString(); }
-function validStatus(v) { return STATUS_VALUES.includes(v) ? v : 'novo'; }
-function validTemp(v) { return TEMPERATURE_VALUES.includes(v) ? v : null; }
-function inferOrigin(t = {}) { const source = String(t.utmSource || t.utm_source || '').toLowerCase(); if (t.fbclid || /facebook|instagram|meta/.test(source)) return 'Meta Ads'; if (t.gclid || source.includes('google')) return 'Google Ads'; if (t.referrer) return 'Referência / orgânico'; return 'Direto / orgânico'; }
-function autoTemperature(l) {
-  if (l.vendaRealizada || l.status === 'fechado') return 'quente';
-  if (l.faturaRecebida || l.status === 'proposta' || l.status === 'negociacao' || l.status === 'visita_realizada') return 'quente';
-  if (l.status === 'sem_resposta' || l.status === 'perdido') return 'frio';
-  if (l.interesse || ['contatado', 'interessado', 'visita_solicitada'].includes(l.status)) return 'morno';
-  if (l.tipo === 'PF/PJ' && l.phone) return 'morno';
-  return 'frio';
-}
-function normalizeLead(input) {
-  const l = { ...input };
-  l.status = validStatus(l.status);
-  l.temperatura = validTemp(l.temperatura) || autoTemperature(l);
-  l.addedAt = l.addedAt || l.createdAt || null;
-  l.createdAt = l.createdAt || l.addedAt || null;
-  l.simulatedAt = l.simulatedAt || (l.origem === 'landing' ? l.addedAt : null);
-  l.lastContact = l.lastContact || null;
-  l.interesse = Boolean(l.interesse || ['interessado', 'visita_solicitada', 'visita_realizada', 'proposta', 'negociacao', 'fechado'].includes(l.status));
-  l.faturaRecebida = Boolean(l.faturaRecebida);
-  l.propostaEnviada = Boolean(l.propostaEnviada || ['proposta', 'negociacao', 'fechado'].includes(l.status));
-  l.vendaRealizada = Boolean(l.vendaRealizada || l.status === 'fechado');
-  l.origem = l.origem || 'Prospecção';
-  l.campanha = l.campanha || l.utmCampaign || '';
-  l.anuncio = l.anuncio || l.utmContent || '';
-  return l;
-}
-
-function loadLeads() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    return raw.map(l => {
-      const lead = normalizeLead(l);
-      if (!lead.systemValue && lead.contaEst) Object.assign(lead, solarEstimate(lead.contaEst, lead.propertyType || 'comercial'));
-      return lead;
+  app.post('/api/capture', limiter({ limit: 12, windowMs: 15 * 60000, message: 'Você enviou várias solicitações. Aguarde alguns minutos antes de tentar novamente.' }), async (req, res) => {
+    const b = req.body || {};
+    if (b.company_website) return res.status(201).json({ ok: true });
+    const name = text(b.nome, 120), phone = phoneDigits(b.whatsapp), city = text(b.cidade, 100);
+    const bill = Number(b.conta), propertyType = b.propertyType;
+    if (name.length < 2) return invalid(res, 'Informe seu nome com pelo menos duas letras.');
+    if (!validPhone(phone)) return invalid(res, 'Informe um WhatsApp brasileiro válido, com DDD.');
+    if (city.length < 2) return invalid(res, 'Informe sua cidade.');
+    if (!Object.hasOwn(PROPERTIES, propertyType)) return invalid(res, 'Escolha o tipo de imóvel.');
+    if (!Number.isFinite(bill) || bill < 150 || bill > 20000) return invalid(res, 'Informe uma conta média entre R$ 150 e R$ 20.000. Para outros valores, fale diretamente com a equipe.');
+    if (b.consentimento !== true) return invalid(res, 'Autorize o contato sobre esta solicitação para continuar.');
+    const at = now(), receipt = 'ES-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+    const adConsent = b.advertisingConsent?.granted === true;
+    const permittedTracking = { ...(b.tracking && typeof b.tracking === 'object' ? b.tracking : {}) };
+    if (!adConsent) for (const key of ['fbclid','gclid','gbraid','wbraid']) delete permittedTracking[key];
+    const tracking = readTracking(permittedTracking);
+    let measurementEventId;
+    const estimate = solarEstimate(bill, propertyType);
+    const publicEstimate = { economyMonth: estimate.economyMonth, economyYear: estimate.economyYear, financingInstallment: estimate.financingInstallment, financingMonths: estimate.financingMonths, paybackMonths: estimate.paybackMonths };
+    const common = { name, phone, city, propertyType, segment: propertyType, segmentLabel: PROPERTIES[propertyType], ...estimate, contaInformada: bill, contaFonte: 'informada', updatedAt: at, lastSimulationAt: at, receipt, advertisingConsent: { version: 'ads-v1', granted: adConsent, recordedAt: at } };
+    await store.update(raw => {
+      const index = raw.findIndex(l => phoneDigits(l.phone) === phone);
+      if (index >= 0) {
+        const l = normalizeLead(raw[index]);
+        measurementEventId = l.adsEventId || 'lead_' + crypto.randomUUID();
+        l.adsEventId = measurementEventId;
+        // Preservar data de aquisição, origem inicial, estágio e temperatura manual.
+        Object.assign(l, common, { lastTracking: tracking, simulationCount: (Number(l.simulationCount) || 1) + 1, consentimento: true, lastConsentAt: at, privacyVersion: '2026-09-v1' });
+        if (!l.temperaturaManual) l.temperatura = autoTemperature(l);
+        history(l, 'Nova pré-análise solicitada pelo site. Dados informados atualizados.');
+        raw[index] = normalizeLead(l);
+      } else {
+        measurementEventId = 'lead_' + crypto.randomUUID();
+        const l = normalizeLead({ id: newId(), adsEventId: measurementEventId, tipo: 'PF/PJ', ...common, ...tracking, canal: 'site', status: 'novo', interesse: true, temperatura: 'morno', temperaturaManual: false, createdAt: at, addedAt: at, simulatedAt: at, simulationCount: 1, consentimento: true, consentimentoAt: at, privacyVersion: '2026-09-v1', notes: 'Solicitação pelo site. Conferir fatura e local antes de apresentar dimensionamento ou valores.' });
+        history(l, 'Pré-análise recebida pelo site, com autorização de contato.'); raw.push(l);
+      }
     });
-  } catch { return []; }
-}
-function saveLeads(leads) { fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true }); fs.writeFileSync(DATA_FILE, JSON.stringify(leads, null, 2)); }
-function scoreLead(l) {
-  const spec = SEGMENTS[l.segment];
-  let s = spec ? 42 + (spec.intensity - 3) * 8 : 42;
-  if (l.phone) s += 20; if (l.city) s += 5; if (l.website) s += 3;
-  const bill = Number(l.contaEst) || 0; if (bill >= 500) s += 10; if (bill >= 1000) s += 10; if (bill >= 3000) s += 8;
-  if (l.propertyType === 'industrial' || l.segment === 'galpao') s += 5; if (l.interesse) s += 5; if (l.faturaRecebida) s += 5;
-  return Math.min(100, s);
-}
+    // Expor somente as estimativas aprovadas: economia, retorno simples e parcela.
+    // Valor total, painéis, potência e dados do CRM permanecem internos.
+    res.status(201).json({ ok: true, receipt, measurement: { eventId: measurementEventId }, estimate: publicEstimate, summary: { nome: name, cidade: city, propertyType, perfil: PROPERTIES[propertyType], contaInformada: bill }, nextStep: 'Envie sua fatura para uma análise personalizada. Dimensionamento, investimento e condições dependem de avaliação técnica e comercial.' });
+  });
 
-// ================= PROSPECÇÃO OPENSTREETMAP =================
-app.post('/api/discover', async (req, res) => {
-  const city = cleanText(req.body && req.body.city, 80);
-  const segments = Array.isArray(req.body && req.body.segments) ? req.body.segments.filter(k => SEGMENTS[k]) : [];
-  if (!city || !segments.length) return res.status(400).json({ error: 'Informe a cidade e pelo menos um segmento.' });
-  const parts = [];
-  for (const key of segments) parts.push(`node${SEGMENTS[key].selector}(area.a);way${SEGMENTS[key].selector}(area.a);`);
-  const query = `[out:json][timeout:35];area["name"="${city.replace(/"/g, '')}"]["boundary"="administrative"]->.a;(${parts.join('')});out center tags 400;`;
-  const endpoints = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
-  try {
-    let data = null, lastError = null;
-    for (const endpoint of endpoints) {
-      try { const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'EstruturaSolarLeadAgent/1.0' }, body: 'data=' + encodeURIComponent(query), signal: AbortSignal.timeout(40000) }); if (!r.ok) { lastError = new Error('HTTP ' + r.status); continue; } data = await r.json(); break; } catch (e) { lastError = e; }
+  app.use(auth.requireAuth);
+  app.get(['/', '/index.html'], async (req, res) => res.set('X-Robots-Tag', 'noindex, nofollow').sendFile(path.join(publicDir, 'index.html')));
+  app.post('/api/logout', auth.logout);
+  app.get('/logout', async (req, res) => res.redirect('/'));
+  app.get('/api/config', async (req, res) => res.json({ ...brand, version: '1.2.0', advertising, preview, production, storageKind: store.kind || 'json', storageConfigured: store.kind === 'postgres' || Boolean(options.dataDir || process.env.DATA_DIR), storage: store.kind === 'postgres' ? 'PostgreSQL externo com transações, cópia anterior e sete backups diários lógicos. Mantenha também backup externo.' : 'Arquivo JSON local, somente para desenvolvimento nesta versão.', estimates: 'Referências internas legadas. Não são orçamento nem dimensionamento técnico.' }));
+  app.get('/api/segments', async (req, res) => res.json(Object.entries(SEGMENTS).map(([key, s]) => ({ key, label: s.label.replace(/^\S+\s/, ''), propertyType: s.propertyType }))));
+  app.get('/api/leads', async (req, res) => res.json(filteredLeads(await readLeads(), req.query)));
+
+  app.post('/api/leads', async (req, res) => {
+    const b = req.body || {}, name = text(b.name, 120), phone = phoneDigits(b.phone), city = text(b.city, 100);
+    if (name.length < 2) return invalid(res, 'Informe o nome do contato ou estabelecimento.');
+    if (phone && !validPhone(phone)) return invalid(res, 'Telefone inválido. Informe o DDD e o número, ou deixe vazio.');
+    if (b.website && !safeWebsite(b.website)) return invalid(res, 'Informe um site com endereço http ou https válido.');
+    const discovered = /^osm-(node|way|relation)-\d+$/.test(b.id || '');
+    const id = discovered ? b.id : newId();
+    const propertyType = Object.hasOwn(PROPERTIES, b.propertyType) ? b.propertyType : 'comercial';
+    const bill = Number(b.contaEst || 0);
+    if (!Number.isFinite(bill) || bill < 0 || bill > 1000000 || (bill > 0 && bill < 150)) return invalid(res, 'Informe uma conta a partir de R$ 150, ou deixe o valor vazio.');
+    const at = now();
+    const l = normalizeLead({ id, name, phone, city, propertyType, segment: Object.hasOwn(SEGMENTS, b.segment) ? b.segment : propertyType, segmentLabel: Object.hasOwn(SEGMENTS, b.segment) ? SEGMENTS[b.segment].label.replace(/^\S+\s/, '') : PROPERTIES[propertyType], tipo: discovered ? 'PJ' : 'PF/PJ', canal: discovered ? 'prospeccao' : 'manual', origem: discovered ? 'Prospecção' : 'Cadastro manual', contaFonte: discovered ? 'estimativa_segmento' : 'informada', ...(bill ? solarEstimate(bill, propertyType) : {}), contaInformada: discovered ? null : bill || null, notes: text(b.notes, 4000), address: text(b.address, 260), website: safeWebsite(b.website), lat: b.lat != null && Number.isFinite(Number(b.lat)) && Math.abs(Number(b.lat)) <= 90 ? Number(b.lat) : null, lon: b.lon != null && Number.isFinite(Number(b.lon)) && Math.abs(Number(b.lon)) <= 180 ? Number(b.lon) : null, status: 'novo', createdAt: at, addedAt: at });
+    history(l, discovered ? 'Adicionado ao funil a partir do OpenStreetMap.' : 'Contato cadastrado manualmente.');
+    await store.update(raw => {
+      if (raw.some(other => other.id === id || (phone && phoneDigits(other.phone) === phone))) throw httpError(409, 'Esse contato já está no funil. Procure pelo nome ou telefone.');
+      raw.push(l);
+    }); res.status(201).json(l);
+  });
+
+  app.patch('/api/leads/:id', async (req, res) => {
+    const updated = await store.update(raw => {
+    const index = raw.findIndex(l => l.id === req.params.id);
+    if (index < 0) throw httpError(404, 'Contato não encontrado.');
+    const l = normalizeLead(raw[index]), b = req.body || {}, has = k => Object.prototype.hasOwnProperty.call(b, k), changed = [];
+    const oldStatus = l.status;
+    if (has('status') && !STATUSES.includes(b.status)) throw httpError(400, 'Etapa inválida.');
+    if (has('temperatura') && !TEMPERATURES.includes(b.temperatura) && b.temperatura !== 'auto') throw httpError(400, 'Temperatura inválida.');
+    if (has('name') && text(b.name,120).length < 2) throw httpError(400, 'Informe o nome.');
+    if (has('phone') && b.phone && !validPhone(b.phone)) throw httpError(400, 'Telefone inválido.');
+    if (has('phone') && b.phone && raw.some(other => other.id !== l.id && phoneDigits(other.phone) === phoneDigits(b.phone))) throw httpError(409, 'Esse telefone já está cadastrado em outro contato.');
+    if (has('website') && b.website && !safeWebsite(b.website)) throw httpError(400, 'Endereço de site inválido.');
+    if (has('nextContactDate') && b.nextContactDate && (!/^\d{4}-\d{2}-\d{2}$/.test(b.nextContactDate) || !Number.isFinite(Date.parse(b.nextContactDate)) || new Date(b.nextContactDate).toISOString().slice(0,10) !== b.nextContactDate)) throw httpError(400, 'Data de próximo contato inválida.');
+    if (has('status')) l.status = b.status;
+    for (const [field, max] of [['name',120],['city',100],['notes',4000],['nextContactDate',10]]) if (has(field)) { const v = text(b[field], max); if (l[field] !== v) changed.push(field); l[field] = v; }
+    if (has('phone')) l.phone = phoneDigits(b.phone);
+    if (has('website')) l.website = safeWebsite(b.website);
+    if (has('faturaRecebida')) l.faturaRecebida = b.faturaRecebida === true;
+    if (has('temperatura')) { l.temperaturaManual = b.temperatura !== 'auto'; if (l.temperaturaManual) l.temperatura = b.temperatura; }
+    if (b.temperaturaManual === false) l.temperaturaManual = false;
+    if (['contatado','interessado','visita_solicitada','visita_realizada','proposta','negociacao','fechado'].includes(l.status)) l.lastContact = l.lastContact || now();
+    if (b.registrarContato === true) { l.lastContact = now(); history(l, 'Contato com o cliente registrado pelo consultor.'); }
+    if (has('cnpj')) { const c = digits(b.cnpj); if (c && c.length !== 14) throw httpError(400, 'Informe um CNPJ numérico de 14 dígitos.'); l.cnpj = c; }
+    if (has('cnpjData')) {
+      l.cnpjData = {};
+      for (const key of ['razao_social','nome_fantasia','situacao','porte','cnae','email','telefone','municipio','uf']) l.cnpjData[key] = text(b.cnpjData?.[key], 300);
     }
-    if (!data) throw lastError || new Error('As fontes de mapas não responderam.');
-    const seen = new Set(), results = [];
-    for (const element of data.elements || []) {
+    l.interesse = l.interesse || ['interessado','visita_solicitada','visita_realizada','proposta','negociacao','fechado'].includes(l.status);
+    l.propostaEnviada = l.propostaEnviada || ['proposta','negociacao','fechado'].includes(l.status);
+    l.vendaRealizada = l.vendaRealizada || l.status === 'fechado';
+    if (!l.temperaturaManual) l.temperatura = autoTemperature(l);
+    if (oldStatus !== l.status) history(l, `Etapa alterada de ${oldStatus} para ${l.status}.`);
+    if (changed.length || has('phone') || has('faturaRecebida') || has('temperatura') || has('cnpjData')) history(l, 'Informações de acompanhamento atualizadas.');
+    l.updatedAt = now(); raw[index] = normalizeLead(l); return raw[index];
+    });
+    res.json(updated);
+  });
+
+  app.delete('/api/leads/:id', async (req, res) => {
+    await store.update(raw => {
+      const index = raw.findIndex(l => l.id === req.params.id);
+      if (index < 0) throw httpError(404, 'Contato não encontrado.');
+      raw.splice(index, 1);
+    });
+    res.json({ ok: true });
+  });
+
+  app.get('/api/metrics', async (req, res) => {
+    const leads = filteredLeads(await readLeads(), req.query), total = leads.length;
+    const count = predicate => leads.filter(predicate).length;
+    const group = key => {
+      const map = new Map(); for (const l of leads) { const v = String(l[key] || 'Não informado'); map.set(v, (map.get(v) || 0) + 1); }
+      return [...map].sort((a,b) => b[1]-a[1]).slice(0,10).map(([name,count]) => ({name,count}));
+    };
+    const sales = count(l => l.status === 'fechado');
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date());
+    res.json({ total, hot: count(l => l.temperatura === 'quente'), warm: count(l => l.temperatura === 'morno'), cold: count(l => l.temperatura === 'frio'), invoices: count(l => l.faturaRecebida), proposals: count(l => l.propostaEnviada), sales, new: count(l => l.status === 'novo'), pending: count(l => l.nextContactDate && l.nextContactDate <= today && !['fechado','perdido'].includes(l.status)), conversion: total ? Math.round(sales / total * 1000) / 10 : 0, byCity: group('city'), byCampaign: group('campanha'), byProperty: group('segmentLabel') });
+  });
+  app.get('/api/export.csv', async (req, res) => {
+    const headers = ['Nome','WhatsApp','Cidade','Perfil','Etapa','Temperatura','Canal','Origem','Campanha','Conta informada','Conta referência interna','Potência interna (kWp)','Painéis internos','Investimento interno','Economia mensal interna','Parcela interna','Payback interno (meses)','Fatura recebida','Próximo contato','Primeiro cadastro','Última solicitação','Observações'];
+    const rows = filteredLeads(await readLeads(),req.query).map(l => [l.name,l.phone,l.city,l.segmentLabel,l.status,l.temperatura,l.canal,l.origem,l.campanha,l.contaInformada,l.contaEst,l.systemKwp,l.panels,l.systemValue,l.economyMonth,l.financingInstallment,l.paybackMonths,l.faturaRecebida ? 'Sim' : 'Não',l.nextContactDate,l.createdAt,l.lastSimulationAt || l.simulatedAt,l.notes]);
+    res.attachment('leads-estrutura-solar.csv').type('text/csv; charset=utf-8').send('\uFEFF' + [headers,...rows].map(row => row.map(csvCell).join(';')).join('\r\n'));
+  });
+  app.get('/api/backup', async (req, res) => res.attachment('leads-backup-' + new Date().toISOString().slice(0,10) + '.json').type('application/json').send(JSON.stringify(await store.read(),null,2)));
+
+  const discoverCache = new Map();
+  app.post('/api/discover', limiter({ limit: 20, windowMs: 60 * 60000, message: 'Limite temporário de buscas atingido. Aguarde antes de consultar o mapa novamente.' }), async (req, res) => {
+    const city = text(req.body?.city,80), segments = [...new Set(Array.isArray(req.body?.segments) ? req.body.segments.filter(k => Object.hasOwn(SEGMENTS,k)) : [])];
+    if (city.length < 2 || !segments.length) return invalid(res, 'Informe a cidade e selecione pelo menos um perfil.');
+    const cacheKey = city.toLowerCase() + segments.sort().join(',');
+    const cached = discoverCache.get(cacheKey); if (cached && cached.until > Date.now()) return res.json(cached.data);
+    const parts = segments.map(key => `nwr${SEGMENTS[key].selector}(area.a);`).join('');
+    const query = `[out:json][timeout:20];area["ISO3166-1"="BR"]["admin_level"="2"]->.br;area["name"=${JSON.stringify(city)}]["boundary"="administrative"]["admin_level"="8"](area.br)->.a;(${parts});out center tags 300;`;
+    let data;
+    for (const endpoint of ['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter']) {
+      try {
+        const r = await fetchExternal(endpoint, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded','User-Agent':'EstruturaSolar/1.1'}, body:'data='+encodeURIComponent(query), signal:AbortSignal.timeout(25000) });
+        if (r.ok) { const d = await r.json(); if (Array.isArray(d.elements) && !d.remark) { data = d; break; } }
+      } catch { /* Tentar a próxima fonte. */ }
+    }
+    if (!data) return res.status(502).json({ error:'Os mapas públicos não responderam no momento. Tente novamente mais tarde ou cadastre o contato manualmente.' });
+    const results = [], seen = new Set();
+    for (const element of data.elements) {
       const tags = element.tags || {}; if (!tags.name) continue;
-      const lat = element.lat || (element.center && element.center.lat) || null; const lon = element.lon || (element.center && element.center.lon) || null;
-      const unique = String(tags.name).toLowerCase().trim() + '|' + (lat || ''); if (seen.has(unique)) continue; seen.add(unique);
-      let segment = segments[0]; for (const key of segments) { const m = SEGMENTS[key].selector.match(/\["([^\"]+)"[=~]"?\^?\(?([^)"$\]]+)/); if (m && tags[m[1]] && m[2].split('|').includes(tags[m[1]])) { segment = key; break; } }
-      const spec = SEGMENTS[segment]; const estimate = solarEstimate(spec.kwh * (spec.propertyType === 'industrial' ? .95 : .86), spec.propertyType);
-      const lead = normalizeLead({ id: 'osm-' + element.type + '-' + element.id, tipo: 'PJ', name: cleanText(tags.name, 160), segment, segmentLabel: spec.label, propertyType: spec.propertyType, phone: cleanText(tags.phone || tags['contact:phone'], 60), website: cleanText(tags.website || tags['contact:website'], 220), address: [tags['addr:street'], tags['addr:housenumber'], tags['addr:suburb'] || tags['addr:neighbourhood']].filter(Boolean).join(', '), city, lat, lon, ...estimate, status: 'novo', origem: 'Prospecção', notes: 'Encontrado em fonte pública. Confirmar responsável e fatura antes do contato.' });
-      lead.score = scoreLead(lead); results.push(lead);
+      const key = text(tags.name).toLowerCase() + '|' + (element.lat || element.center?.lat || ''); if (seen.has(key)) continue; seen.add(key);
+      const segment = segments.find(k => { const m = SEGMENTS[k].selector.match(/\["([^"]+)"="([^"]+)"\]/); return m && tags[m[1]] === m[2]; }) || segments[0];
+      const spec = SEGMENTS[segment];
+      const rawPhone = text(tags.phone || tags['contact:phone'],100).split(/[;,/]/)[0];
+      results.push(normalizeLead({ id:`osm-${element.type}-${element.id}`, name:text(tags.name,120), phone:validPhone(rawPhone) ? phoneDigits(rawPhone) : '', city, propertyType:spec.propertyType, segment, segmentLabel:spec.label.replace(/^\S+\s/,''), tipo:'PJ', canal:'prospeccao', origem:'Prospecção', contaFonte:'estimativa_segmento', ...solarEstimate(spec.kwh*(spec.propertyType === 'industrial' ? .95 : .86),spec.propertyType), website:safeWebsite(tags.website || tags['contact:website']), address:[tags['addr:street'],tags['addr:housenumber'],tags['addr:suburb']].filter(Boolean).join(', '), lat:element.lat ?? element.center?.lat ?? null, lon:element.lon ?? element.center?.lon ?? null, status:'novo', notes:'Fonte: OpenStreetMap. Consumo estimado por segmento, não confirmado. Verificar responsável, fatura e pertinência antes de abordar.' }));
     }
-    results.sort((a, b) => b.score - a.score); res.json({ count: results.length, results });
-  } catch (e) { res.status(502).json({ error: 'Falha na busca de mapas: ' + e.message }); }
-});
+    results.sort((a,b) => b.score-a.score);
+    const response = { count:results.length, results, source:'© OpenStreetMap contributors · ODbL' };
+    if (discoverCache.size >= 50) discoverCache.delete(discoverCache.keys().next().value);
+    discoverCache.set(cacheKey,{ until:Date.now()+5*60000, data:response }); res.json(response);
+  });
 
-// ================= CNPJ =================
-app.get('/api/cnpj/:cnpj', async (req, res) => {
-  const cnpj = digits(req.params.cnpj); if (cnpj.length !== 14) return res.status(400).json({ error: 'O CNPJ deve ter 14 dígitos.' });
-  for (const source of ['https://brasilapi.com.br/api/cnpj/v1/' + cnpj, 'https://minhareceita.org/' + cnpj]) {
-    try { const r = await fetch(source, { signal: AbortSignal.timeout(12000) }); if (!r.ok) continue; const d = await r.json(); return res.json({ cnpj, razao_social: d.razao_social || '', nome_fantasia: d.nome_fantasia || '', situacao: d.descricao_situacao_cadastral || d.situacao_cadastral || '', porte: d.porte || d.descricao_porte || '', cnae: (d.cnae_fiscal_descricao || '') + (d.cnae_fiscal ? ` (${d.cnae_fiscal})` : ''), email: d.email || '', telefone: d.ddd_telefone_1 || '', municipio: d.municipio || '', uf: d.uf || '', socios: (d.qsa || []).map(s => (s.nome_socio || '') + (s.qualificacao_socio ? ' — ' + s.qualificacao_socio : '')).slice(0, 6) }); } catch { /* próxima fonte */ }
-  }
-  res.status(502).json({ error: 'Nenhuma fonte pública respondeu para este CNPJ.' });
-});
+  app.get('/api/cnpj/:cnpj', async (req, res) => {
+    const cnpj = req.params.cnpj.replace(/[.\-/\s]/g,'');
+    if (!/^\d{14}$/.test(cnpj)) return invalid(res, 'Esta consulta aceita CNPJ numérico de 14 dígitos.');
+    for (const source of ['https://brasilapi.com.br/api/cnpj/v1/'+cnpj,'https://minhareceita.org/'+cnpj]) {
+      try {
+        const r = await fetchExternal(source,{signal:AbortSignal.timeout(12000)}); if (!r.ok) continue;
+        const d = await r.json();
+        return res.json({ cnpj, razao_social:text(d.razao_social,300), nome_fantasia:text(d.nome_fantasia,300), situacao:text(d.descricao_situacao_cadastral || d.situacao_cadastral), porte:text(d.porte || d.descricao_porte), cnae:text(d.cnae_fiscal_descricao,300), email:text(d.email), telefone:text(d.ddd_telefone_1), municipio:text(d.municipio), uf:text(d.uf,2) });
+      } catch { /* Próxima fonte. */ }
+    }
+    res.status(502).json({ error:'Não foi possível consultar esse CNPJ nas fontes públicas. Confirme o número e tente mais tarde.' });
+  });
 
-// ================= CAPTURA DA LANDING =================
-app.post('/api/capture', (req, res) => {
-  const body = req.body || {}; const nome = cleanText(body.nome, 120); const whatsapp = digits(body.whatsapp); const cidade = cleanText(body.cidade, 100); const propertyType = ['residencial', 'comercial', 'industrial', 'rural'].includes(body.propertyType) ? body.propertyType : 'residencial'; const conta = Number(body.conta);
-  if (!nome || whatsapp.length < 10 || !Number.isFinite(conta) || conta < 150) return res.status(400).json({ error: 'Preencha nome, WhatsApp válido e uma conta média de pelo menos R$ 150.' });
-  const tracking = body.tracking && typeof body.tracking === 'object' ? body.tracking : body; const createdAt = isoNow(); const estimate = solarEstimate(conta, propertyType); const leads = loadLeads(); const existing = leads.find(l => phoneDigits(l.phone) === phoneDigits(whatsapp));
-  const common = { name: nome, phone: phoneDigits(whatsapp), city: cidade, propertyType, ...estimate, origem: cleanText(tracking.origem, 80) || 'Direto / orgânico', plataforma: cleanText(tracking.utmSource || tracking.utm_source, 100), campanha: cleanText(tracking.utmCampaign || tracking.utm_campaign, 160), anuncio: cleanText(tracking.utmContent || tracking.utm_content, 160), utmSource: cleanText(tracking.utmSource || tracking.utm_source, 120), utmMedium: cleanText(tracking.utmMedium || tracking.utm_medium, 120), utmCampaign: cleanText(tracking.utmCampaign || tracking.utm_campaign, 160), utmContent: cleanText(tracking.utmContent || tracking.utm_content, 160), utmTerm: cleanText(tracking.utmTerm || tracking.utm_term, 160), fbclid: cleanText(tracking.fbclid, 240), gclid: cleanText(tracking.gclid, 240), referrer: cleanText(tracking.referrer, 300), simulatedAt: createdAt, createdAt, consentimento: body.consentimento !== false };
-  if (existing) { Object.assign(existing, common, { lastSimulationAt: createdAt }); existing.temperatura = autoTemperature(existing); existing.score = scoreLead(existing); saveLeads(leads); return res.json({ ok: true, dup: true, economiaAno: existing.economyYear || existing.economiaAno, leadId: existing.id }); }
-  const lead = normalizeLead({ id: 'solar-' + Date.now(), tipo: 'PF/PJ', segment: propertyType, segmentLabel: propertyType === 'residencial' ? '🏠 Residencial' : propertyType === 'industrial' ? '🏭 Indústria' : propertyType === 'rural' ? '🌾 Rural' : '🏢 Comércio / empresa', ...common, status: 'novo', temperatura: 'morno', temperaturaManual: false, interesse: true, faturaRecebida: false, propostaEnviada: false, vendaRealizada: false, notes: 'Lead captado pela landing. Solicitar fatura e confirmar viabilidade.' });
-  lead.score = scoreLead(lead); leads.push(lead); saveLeads(leads); return res.json({ ok: true, economiaAno: lead.economyYear, leadId: lead.id });
-});
-function phoneDigits(value) { let d = digits(value); if (d.startsWith('55')) d = d.slice(2); if (d.startsWith('0')) d = d.slice(1); return d; }
-app.get('/captar', (req, res) => res.sendFile(path.join(__dirname, 'public', 'captar.html')));
+  app.use(async (req, res) => {
+    if (req.path.startsWith('/api/')) return res.status(404).json({ error:'Recurso não encontrado.' });
+    res.status(404).type('text').send('Página não encontrada. Acesse /captar ou /login.');
+  });
+  app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    if (err.expose === true && [400,404,409].includes(err.status)) return res.status(err.status).json({ error: err.message });
+    if (err.type === 'entity.parse.failed') return res.status(400).json({ error:'Dados enviados em formato inválido.' });
+    if (err.type === 'entity.too.large') return res.status(413).json({ error:'Solicitação muito grande. Reduza o conteúdo e tente novamente.' });
+    console.error('[Estrutura Solar]', err.code || err.name, err.code === 'DATA_CORRUPT' ? 'Arquivo de dados inválido; gravação bloqueada.' : 'Falha na operação.');
+    res.status(503).json({ error:err.code === 'DATA_CORRUPT' && auth.authed(req) ? err.message : 'Não foi possível concluir agora. Seus dados não foram confirmados; tente novamente em instantes.' });
+  });
+  return app;
+}
 
-// ================= FUNIL =================
-app.get('/api/leads', (req, res) => res.json(loadLeads()));
-app.post('/api/leads', (req, res) => { const incoming = req.body || {}; if (!incoming.id || !incoming.name) return res.status(400).json({ error: 'Lead inválido.' }); const leads = loadLeads(); if (leads.some(l => l.id === incoming.id)) return res.status(409).json({ error: 'Lead já está no funil.' }); const lead = normalizeLead({ ...incoming, addedAt: isoNow() }); lead.score = scoreLead(lead); leads.push(lead); saveLeads(leads); res.json({ ok: true, total: leads.length }); });
-app.patch('/api/leads/:id', (req, res) => {
-  const leads = loadLeads(); const lead = leads.find(l => l.id === req.params.id); if (!lead) return res.status(404).json({ error: 'Lead não encontrado.' }); const body = req.body || {};
-  if (Object.prototype.hasOwnProperty.call(body, 'status')) lead.status = validStatus(body.status);
-  if (Object.prototype.hasOwnProperty.call(body, 'temperatura')) { const t = validTemp(body.temperatura); if (t) lead.temperatura = t; }
-  if (Object.prototype.hasOwnProperty.call(body, 'temperaturaManual')) lead.temperaturaManual = Boolean(body.temperaturaManual);
-  for (const f of ['notes', 'website', 'cnpj', 'lastContact']) if (Object.prototype.hasOwnProperty.call(body, f)) lead[f] = cleanText(body[f], f === 'notes' ? 1200 : 260);
-  if (Object.prototype.hasOwnProperty.call(body, 'phone')) lead.phone = phoneDigits(body.phone);
-  for (const f of ['faturaRecebida', 'propostaEnviada', 'vendaRealizada', 'interesse']) if (Object.prototype.hasOwnProperty.call(body, f)) lead[f] = Boolean(body[f]);
-  if (Object.prototype.hasOwnProperty.call(body, 'cnpjData')) lead.cnpjData = body.cnpjData && typeof body.cnpjData === 'object' ? body.cnpjData : null;
-  if (['contatado', 'interessado', 'visita_solicitada', 'visita_realizada', 'proposta', 'negociacao'].includes(lead.status)) lead.lastContact = lead.lastContact || isoNow();
-  if (lead.status === 'visita_realizada') lead.interesse = true; if (lead.status === 'proposta' || lead.status === 'negociacao' || lead.status === 'fechado') lead.propostaEnviada = true; if (lead.status === 'fechado') lead.vendaRealizada = true; if (lead.status === 'sem_resposta') lead.temperatura = 'frio';
-  lead.temperatura = lead.temperaturaManual ? (validTemp(lead.temperatura) || 'morno') : autoTemperature(lead); lead.score = scoreLead(lead); saveLeads(leads); res.json(lead);
-});
-app.delete('/api/leads/:id', (req, res) => { saveLeads(loadLeads().filter(l => l.id !== req.params.id)); res.json({ ok: true }); });
-
-// ================= INDICADORES =================
-app.get('/api/metrics', (req, res) => {
-  let leads = loadLeads(); const days = Number(req.query.days) || 0; const campaign = cleanText(req.query.campaign, 160).toLowerCase();
-  if (days) { const cutoff = Date.now() - days * 86400000; leads = leads.filter(l => new Date(l.simulatedAt || l.addedAt || 0).getTime() >= cutoff); }
-  if (campaign) leads = leads.filter(l => String(l.campanha || l.utmCampaign || '').toLowerCase().includes(campaign));
-  const total = leads.length, hot = leads.filter(l => l.temperatura === 'quente').length, warm = leads.filter(l => l.temperatura === 'morno').length, cold = leads.filter(l => l.temperatura === 'frio').length, invoices = leads.filter(l => l.faturaRecebida).length, proposals = leads.filter(l => l.propostaEnviada).length, sales = leads.filter(l => l.vendaRealizada || l.status === 'fechado').length;
-  const kwh = leads.filter(l => Number(l.kwhEst) > 0).map(l => Number(l.kwhEst)); const econ = leads.filter(l => Number(l.economyMonth) > 0).map(l => Number(l.economyMonth));
-  const group = key => Object.entries(leads.reduce((a, l) => { const v = String(l[key] || 'Não informado'); a[v] = (a[v] || 0) + 1; return a; }, {})).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([name, count]) => ({ name, count }));
-  res.json({ total, hot, warm, cold, invoices, proposals, sales, conversion: total ? Math.round((sales / total) * 1000) / 10 : 0, avgKwh: kwh.length ? Math.round(kwh.reduce((a, b) => a + b, 0) / kwh.length) : 0, avgEconomyMonth: econ.length ? Math.round(econ.reduce((a, b) => a + b, 0) / econ.length) : 0, byCity: group('city'), byProperty: group('segmentLabel'), byCampaign: group('campanha') });
-});
-
-app.get('/api/export.csv', (req, res) => {
-  const leads = loadLeads(); const esc = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
-  const header = ['Nome', 'Tipo', 'WhatsApp', 'Cidade', 'Segmento', 'Conta (R$/mês)', 'Sistema (kWp)', 'Painéis', 'Valor do sistema', 'Economia (R$/mês)', 'Parcela financiamento', 'Payback (meses)', 'Status', 'Temperatura', 'Origem', 'Campanha', 'Data da simulação', 'Último contato', 'Fatura', 'Proposta', 'Venda', 'Score', 'Observações'];
-  const rows = leads.map(l => [l.name, l.tipo, l.phone, l.city, l.segmentLabel, l.contaEst, l.systemKwp, l.panels, l.systemValue, l.economyMonth, l.financingInstallment, l.paybackMonths, l.status, l.temperatura, l.origem, l.campanha, l.simulatedAt || l.addedAt, l.lastContact, l.faturaRecebida ? 'Sim' : 'Não', l.propostaEnviada ? 'Sim' : 'Não', l.vendaRealizada ? 'Sim' : 'Não', l.score, l.notes].map(esc).join(';'));
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8'); res.setHeader('Content-Disposition', 'attachment; filename="leads-estrutura-solar.csv"'); res.send('\uFEFF' + header.map(esc).join(';') + '\n' + rows.join('\n'));
-});
-app.get('/api/segments', (req, res) => res.json(Object.entries(SEGMENTS).map(([key, s]) => ({ key, label: s.label, kwh: s.kwh, intensity: s.intensity, propertyType: s.propertyType }))));
-app.get('/api/config', (req, res) => res.json({ brand: 'Estrutura Energia Solar', whatsapp: '5547989022728', region: CITY_REGION }));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log('Estrutura Energia Solar — agente de leads na porta ' + PORT));
+if (require.main === module) {
+  (async () => {
+    if (fs.existsSync(path.join(__dirname,'.env')) && process.loadEnvFile) process.loadEnvFile(path.join(__dirname,'.env'));
+    const app = createApp();
+    await app.locals.store.ready;
+    const port = Number(process.env.PORT) || 3000;
+    const server = app.listen(port,'0.0.0.0',() => console.log(`Estrutura Energia Solar v1.2 — porta ${port} — ${app.locals.store.kind || 'JSON local'}`));
+    process.on('SIGTERM',() => server.close(async () => { await app.locals.store.close?.(); process.exit(0); }));
+  })().catch(error => { console.error('[Estrutura Solar] Inicialização interrompida. Confira PANEL_SENHA e DATABASE_URL na hospedagem.', error.code || error.name); process.exit(1); });
+}
+module.exports = { createApp };

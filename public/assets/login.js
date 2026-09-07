@@ -1,0 +1,6 @@
+import { api, initIcons, loadBrand } from './shared.js';
+initIcons();loadBrand();
+const form=document.getElementById('login-form'),button=document.getElementById('login-submit'),error=document.getElementById('login-error'),input=document.getElementById('senha');
+if(new URLSearchParams(location.search).has('expired'))document.getElementById('expired-notice').hidden=false;
+document.getElementById('toggle-password').addEventListener('click',event=>{const show=input.type==='password';input.type=show?'text':'password';event.currentTarget.setAttribute('aria-label',show?'Ocultar senha':'Mostrar senha');event.currentTarget.setAttribute('aria-pressed',String(show));});
+form.addEventListener('submit',async event=>{event.preventDefault();if(button.disabled||!form.reportValidity())return;button.disabled=true;error.hidden=true;button.innerHTML='<span>Entrando…</span><span class="spinner"></span>';try{await api('/api/login',{method:'POST',body:{senha:input.value}});try{await api('/api/config');}catch(e){if(e.status===401)throw new Error('Seu navegador não manteve a sessão. Use o link “Abrir em nova aba” abaixo e entre por lá.');throw e;}input.value='';location.assign('/');}catch(e){error.textContent=e.message;error.hidden=false;}finally{button.disabled=false;button.innerHTML='<span>Entrar no painel</span><span data-icon="arrow"></span>';initIcons(button);}});
